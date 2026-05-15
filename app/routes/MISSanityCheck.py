@@ -6,7 +6,10 @@ import re
 import difflib
 
 logger = logging.getLogger(__name__)
-pd.set_option('future.no_silent_downcasting', True)
+try:
+    pd.set_option('future.no_silent_downcasting', True)
+except Exception:
+    pass
 
 router = APIRouter()
 
