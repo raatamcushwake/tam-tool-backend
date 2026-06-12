@@ -69,6 +69,7 @@ def process_mis_sanity(prev_content, curr_content):
 
         all_units = []
         new_bookings = []
+        already_cancelled_units = set()
         transferred_units = []
         name_corrections = []
         cancelled_units = []
@@ -120,8 +121,22 @@ def process_mis_sanity(prev_content, curr_content):
                             unit_data['transfer_detected'] = True
                             transferred_units.append(unit_data)
                         else:
-                            unit_data['anomaly_detected'] = True
-                            anomaly_units.append(unit_data)
+                            # Treat as CANCELLATION of old + NEW BOOKING for new customer
+                            cancelled_row = prev_unit.copy()
+                            cancelled_row.update({
+                                'Unit No.': unit_no,
+                                'is_cancelled': True,
+                                'prev_customer': prev_name,
+                                'Customer Name': prev_name,
+                            })
+                            cancelled_units.append(cancelled_row)
+                            already_cancelled_units.add(unit_no)
+
+                            # Current unit is a new booking
+                            unit_data['is_new'] = True
+                            unit_data['rebooked'] = True
+                            unit_data['prev_customer'] = prev_name
+                            new_bookings.append(unit_data)
 
                 params = [
                     ('Agreement value', 'agreement', agreement_decreased, agreement_increased),
@@ -161,7 +176,7 @@ def process_mis_sanity(prev_content, curr_content):
             all_units.append(unit_data)
 
         for unit_no, prev_data in prev_lookup.items():
-            if unit_no not in curr_lookup:
+            if unit_no not in curr_lookup and unit_no not in already_cancelled_units:
                 cancelled_unit = prev_data.copy()
                 cancelled_unit.update({
                     'Unit No.': unit_no,

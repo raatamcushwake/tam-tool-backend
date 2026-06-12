@@ -19,6 +19,7 @@ async def create_project_simple(request: SimpleProjectRequest):
         project_data = {
             "id": project_ref.id,
             "name": request.name,
+            "projectName": request.name,
             "description": request.description,
             "status": "ACTIVE",
             "members": {},
@@ -48,6 +49,7 @@ async def create_project(request: ProjectRequest):
         project_data = {
             "id": project_ref.id,
             "name": request.name,
+            "projectName": request.name,
             "description": request.description,
             "status": "ACTIVE",
             "members": {

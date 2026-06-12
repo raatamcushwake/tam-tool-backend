@@ -92,6 +92,7 @@ def process_comparison(prev_content, curr_content):
 
         final_rows = []
         sold_count = 0
+        already_cancelled_units = set()
 
         for _, row in df_curr.iterrows():
             unit_no = str(row.get("Unit No.", "")).strip()
@@ -159,10 +160,101 @@ def process_comparison(prev_content, curr_content):
                         )
                         if prev_exists_elsewhere or curr_existed_in_prev:
                             status = "TRANSFER"
-                            change_log = f"[TRANSFER] {prev_name} → {curr_name_raw}"
+                            prev_unit_no = next(
+                                (u for u, r in prev_lookup.items()
+                                 if str(r.get("Customer Name", "")).strip().lower() == curr_name_lower and u != unit_no),
+                                None
+                            )
+                            from_unit = prev_unit_no or next(
+                                (u for u, r in curr_lookup.items()
+                                 if str(r.get("Customer Name", "")).strip().lower() == prev_name.lower() and u != unit_no),
+                                unit_no
+                            )
+                            # Customer name in from_unit in prev month
+                            from_unit_prev_name = str(prev_lookup.get(from_unit, {}).get("Customer Name", "")).strip() or prev_name
+                            # Customer name in current unit (unit_no) in prev month
+                            curr_unit_prev_name = str(prev_lookup.get(unit_no, {}).get("Customer Name", "")).strip()
+                            change_log = f"[TRANSFER] Unit {from_unit} → Unit {unit_no} | Customer: {from_unit_prev_name} → {curr_name_raw} | PrevOccupant: {curr_unit_prev_name}"
                         else:
-                            status = "ANOMALY"
-                            change_log = f"[ANOMALY] {prev_name} → {curr_name_raw}"
+                            # Check booking date to decide: TRANSFER (same date) or CANCELLATION + NEW (date changed)
+                            curr_booking_date = str(unit_data.get("Booking Date", "")).strip()
+                            prev_booking_date = str(prev_unit.get("Booking Date", "")).strip()
+
+                            booking_date_same = (
+                                curr_booking_date != "" and
+                                prev_booking_date != "" and
+                                curr_booking_date != "-" and
+                                prev_booking_date != "-" and
+                                curr_booking_date == prev_booking_date
+                            )
+
+                            if booking_date_same:
+                                # Same booking date, different customer = TRANSFER (resale on same unit)
+                                status = "TRANSFER"
+                                curr_unit_prev_name = str(prev_lookup.get(unit_no, {}).get("Customer Name", "")).strip()
+                                change_log = f"[TRANSFER] Unit {unit_no} → Unit {unit_no} | Customer: {prev_name} → {curr_name_raw} | PrevOccupant: {curr_unit_prev_name}"
+                                demand_inc = 0.0
+                                received_inc = 0.0
+                                unit_data["prev_agreement"] = clean_num(prev_unit.get("Agreement value", 0))
+                                unit_data["agreement_delta"] = 0
+                                unit_data["prev_amount_received"] = clean_num(prev_unit.get("Amount Received excl. Tax", 0))
+                                unit_data["amount_received_delta"] = 0
+                                unit_data["prev_demand"] = clean_num(prev_unit.get("Demand Raised as on Current Month excl. tax", 0))
+                                unit_data["demand_delta"] = 0
+                                unit_data["prev_saleable"] = clean_num(prev_unit.get("Saleable area in sft", 0))
+                                unit_data["saleable_delta"] = 0
+                                unit_data["prev_carpet"] = clean_num(prev_unit.get("Carpet area in sft", 0))
+                                unit_data["carpet_delta"] = 0
+
+                            else:
+                                # Booking date changed = genuine cancellation + new booking
+                                p_demand = clean_num(prev_unit.get("Demand Raised as on Current Month excl. tax", 0))
+                                p_received = clean_num(prev_unit.get("Amount Received excl. Tax", 0))
+                                cancelled_row = prev_unit.copy()
+                                cancelled_row.update({
+                                    "Unit No.": unit_no,
+                                    "Status": "CANCELLATION",
+                                    "Change Details": f"[CANCELLATION] {prev_name}",
+                                    "Customer Name": prev_name,
+                                    "DEMAND_INCREMENT_VAL": 0.0,
+                                    "RECEIVED_INCREMENT_VAL": 0.0,
+                                    "AGREEMENT_INCREMENT_VAL": 0.0,
+                                    "Rate per sft": 0,
+                                    "Disbursement": "N/A",
+                                    "Amount Received excl. Tax Current Month": p_received,
+                                    "Outstanding against demand": round(p_demand - p_received, 2),
+                                    "O/S % Demand": round(((p_demand - p_received) / p_demand * 100) if p_demand > 0 else 0, 2),
+                                    "Outstanding against sale value": 0,
+                                    "O/S against Sale Value": 0,
+                                    "Upto 30 days": "Not applicable",
+                                    "30 - 60 days": 0,
+                                    "Greater than 60 days": 0,
+                                    "Total aging": 0,
+                                    "REFERENCE_MSP": 0,
+                                    "prev_agreement": 0, "agreement_delta": 0,
+                                    "prev_amount_received": 0, "amount_received_delta": 0,
+                                    "prev_demand": 0, "demand_delta": 0,
+                                    "prev_saleable": 0, "saleable_delta": 0,
+                                    "prev_carpet": 0, "carpet_delta": 0,
+                                })
+                                final_rows.append(cancelled_row)
+                                already_cancelled_units.add(unit_no)
+
+                                # Current unit becomes NEW BOOKING
+                                status = "NEW"
+                                change_log = f"[NEW BOOKING] {prev_name} cancelled, rebooked to {curr_name_raw}"
+                                demand_inc = demand_raised
+                                received_inc = amount_received
+                                unit_data["prev_agreement"] = 0
+                                unit_data["agreement_delta"] = 0
+                                unit_data["prev_amount_received"] = 0
+                                unit_data["amount_received_delta"] = amount_received
+                                unit_data["prev_demand"] = 0
+                                unit_data["demand_delta"] = demand_raised
+                                unit_data["prev_saleable"] = 0
+                                unit_data["saleable_delta"] = clean_num(unit_data.get("Saleable area in sft", 0))
+                                unit_data["prev_carpet"] = 0
+                                unit_data["carpet_delta"] = clean_num(unit_data.get("Carpet area in sft", 0))
 
                 # Value changes
                 params = [
@@ -214,14 +306,25 @@ def process_comparison(prev_content, curr_content):
             # Aging computation
             variation_in_demand = demand_inc if demand_inc > 0 else 0
             aging_3060 = 0.0
-            aging_60plus = 0.0
+            aging_6090 = 0.0
+            aging_90180 = 0.0
+            aging_180365 = 0.0
+            aging_365plus = 0.0
+
             if os_against_demand > 0:
-                if os_against_demand > variation_in_demand:
-                    aging_3060 = variation_in_demand
-                    aging_60plus = os_against_demand - variation_in_demand
-                else:
-                    aging_3060 = os_against_demand
-                    aging_60plus = 0.0
+                remaining = os_against_demand
+                aging_3060 = min(variation_in_demand, remaining)
+                remaining -= aging_3060
+                if remaining > 0:
+                    prev_demand_val = clean_num(prev_lookup.get(unit_no, {}).get("Demand Raised as on Current Month excl. tax", 0)) if not is_new else 0
+                    chunk = prev_demand_val * 0.25
+                    aging_6090 = min(chunk, remaining)
+                    remaining -= aging_6090
+                    aging_90180 = min(chunk, remaining)
+                    remaining -= aging_90180
+                    aging_180365 = min(chunk, remaining)
+                    remaining -= aging_180365
+                    aging_365plus = remaining
 
             unit_data.update({
                 "Status": status,
@@ -238,8 +341,11 @@ def process_comparison(prev_content, curr_content):
                 "O/S against Sale Value": round(os_pct_sale, 2),
                 "Upto 30 days": "Not applicable",
                 "30 - 60 days": round(aging_3060, 2),
-                "Greater than 60 days": round(aging_60plus, 2),
-                "Total aging": round(aging_3060 + aging_60plus, 2),
+                "60 - 90 days": round(aging_6090, 2),
+                "90 - 180 days": round(aging_90180, 2),
+                "180 - 365 days": round(aging_180365, 2),
+                "Greater than 365 days": round(aging_365plus, 2),
+                "Total aging": round(aging_3060 + aging_6090 + aging_90180 + aging_180365 + aging_365plus, 2),
                 "REFERENCE_MSP": 0,
             })
 
@@ -247,7 +353,7 @@ def process_comparison(prev_content, curr_content):
 
         # Cancelled units missing from current
         for unit_no, prev_data in prev_lookup.items():
-            if unit_no not in curr_lookup:
+            if unit_no not in curr_lookup and unit_no not in already_cancelled_units:
                 prev_name = str(prev_data.get("Customer Name", "")).strip()
                 if prev_name.lower() not in ["", "nan", "n/a", "-", "unsold"]:
                     p_demand = clean_num(prev_data.get("Demand Raised as on Current Month excl. tax", 0))
@@ -257,7 +363,7 @@ def process_comparison(prev_content, curr_content):
                         "Unit No.": unit_no,
                         "Status": "CANCELLATION",
                         "Change Details": f"[CANCELLATION] {prev_name}",
-                        "Customer Name": "MISSING IN CURRENT",
+                        "Customer Name": prev_name,
                         "DEMAND_INCREMENT_VAL": 0.0,
                         "RECEIVED_INCREMENT_VAL": 0.0,
                         "AGREEMENT_INCREMENT_VAL": 0.0,
@@ -270,7 +376,10 @@ def process_comparison(prev_content, curr_content):
                         "O/S against Sale Value": 0,
                         "Upto 30 days": "Not applicable",
                         "30 - 60 days": 0,
-                        "Greater than 60 days": 0,
+                        "60 - 90 days": 0,
+                        "90 - 180 days": 0,
+                        "180 - 365 days": 0,
+                        "Greater than 365 days": 0,
                         "Total aging": 0,
                         "REFERENCE_MSP": 0,
                         "prev_agreement": 0, "agreement_delta": 0,
@@ -303,16 +412,23 @@ def process_comparison(prev_content, curr_content):
                 if curr_cust in prev_customer_to_unit:
                     old_unit = prev_customer_to_unit[curr_cust]
                     if old_unit != curr_unit:
+                        prev_name_for_unit = str(prev_lookup.get(curr_unit, {}).get("Customer Name", "")).strip()
+                        curr_name_for_unit = str(row.get("Customer Name", "")).strip()
                         row["Status"] = "TRANSFER"
-                        row["Change Details"] = f"[TRANSFER] Unit {old_unit} → Unit {curr_unit} | Customer: {row.get('Customer Name')}"
+                        row["Change Details"] = f"[TRANSFER] Unit {old_unit} → Unit {curr_unit} | Customer: {prev_name_for_unit} → {curr_name_for_unit}"
 
             if row.get("Status") == "NEW":
                 curr_cust = str(row.get("Customer Name", "")).strip().upper()
                 curr_unit = str(row.get("Unit No.", "")).strip()
                 from_unit = cancelled_customers.get(curr_cust)
                 if from_unit and from_unit != curr_unit:
+                    # Name of customer who was in from_unit in prev month
+                    from_unit_prev_name = str(prev_lookup.get(from_unit, {}).get("Customer Name", "")).strip()
+                    # Name of customer who was in curr_unit in prev month
+                    curr_unit_prev_name = str(prev_lookup.get(curr_unit, {}).get("Customer Name", "")).strip()
+                    curr_name_for_unit = str(row.get("Customer Name", "")).strip()
                     row["Status"] = "TRANSFER"
-                    row["Change Details"] = f"[TRANSFER] Unit {from_unit} → Unit {curr_unit} | Customer: {row.get('Customer Name')}"
+                    row["Change Details"] = f"[TRANSFER] Unit {from_unit} → Unit {curr_unit} | Customer: {from_unit_prev_name} → {curr_name_for_unit} | PrevOccupant: {curr_unit_prev_name}"
 
         # Clean NaN
         import math

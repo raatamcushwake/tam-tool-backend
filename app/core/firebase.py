@@ -1,5 +1,5 @@
 import firebase_admin
-from firebase_admin import credentials, firestore, auth
+from firebase_admin import credentials, firestore, auth, storage
 import json
 import os
 
@@ -14,7 +14,17 @@ def init_firebase():
             cred = credentials.Certificate(key_dict)
         else:
             cred = credentials.Certificate("serviceAccountKey.json")
-        _app = firebase_admin.initialize_app(cred)
+        
+        # Read project ID from service account key to set storage bucket
+        if key_json:
+            project_id = json.loads(key_json).get("project_id", "")
+        else:
+            with open("serviceAccountKey.json") as f:
+                project_id = json.load(f).get("project_id", "")
+        
+        _app = firebase_admin.initialize_app(cred, {
+            'storageBucket': f'{project_id}.appspot.com'
+        })
     return _app
 
 def get_firestore():
@@ -22,3 +32,6 @@ def get_firestore():
 
 def get_auth():
     return auth
+
+def get_storage_bucket():
+    return storage.bucket()
