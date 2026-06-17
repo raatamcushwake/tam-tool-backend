@@ -1,7 +1,5 @@
 import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import resend
 from fastapi import APIRouter, HTTPException
 from firebase_admin import auth, firestore
 from app.core.firebase import get_firestore
@@ -76,14 +74,6 @@ async def forgot_password(request: ForgotPasswordRequest):
         user = auth.get_user_by_email(request.email)
         reset_link = auth.generate_password_reset_link(request.email)
 
-        sender_email = os.getenv("SMTP_EMAIL")
-        sender_password = os.getenv("SMTP_PASSWORD")
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "Reset your TAM Tool password"
-        msg["From"] = f"TAM Tool <{sender_email}>"
-        msg["To"] = request.email
-
         html = f"""
         <html><body style="font-family:Arial,sans-serif;padding:20px;">
         <div style="max-width:500px;margin:auto;border:1px solid #e5e7eb;border-radius:12px;padding:32px;">
@@ -107,11 +97,14 @@ async def forgot_password(request: ForgotPasswordRequest):
         </div>
         </body></html>
         """
-        msg.attach(MIMEText(html, "html"))
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, request.email, msg.as_string())
+        resend.api_key = os.getenv("RESEND_API_KEY")
+        resend.Emails.send({
+            "from": "TAM Tool <onboarding@resend.dev>",
+            "to": request.email,
+            "subject": "Reset your TAM Tool password",
+            "html": html
+        })
 
         print(f"✅ Password reset email sent to {request.email}")
         return {"message": "Password reset email sent successfully"}
