@@ -21,6 +21,10 @@ class RegisterRequest(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     email: str
 
+class ResetPasswordRequest(BaseModel):
+    uid: str
+    new_password: str
+
 @router.post("/create-user")
 async def create_user(request: CreateUserRequest):
     try:
@@ -67,6 +71,16 @@ async def register_user(request: RegisterRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
+@router.post("/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    try:
+        auth.update_user(request.uid, password=request.new_password)
+        return {"message": "Password reset successfully"}
+    except Exception as e:
+        print(f"ERROR in reset_password: {e}")
+        raise HTTPException(status_code=500, detail="Failed to reset password")
+    
 @router.post("/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest):
     try:
