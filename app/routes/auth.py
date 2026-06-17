@@ -1,3 +1,7 @@
+import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from fastapi import APIRouter, HTTPException
 from firebase_admin import auth, firestore
 from app.core.firebase import get_firestore
@@ -16,6 +20,9 @@ class RegisterRequest(BaseModel):
     password: str
     name: str
     phone: str = ""
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
 
 @router.post("/create-user")
 async def create_user(request: CreateUserRequest):
@@ -63,6 +70,58 @@ async def register_user(request: RegisterRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@router.post("/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    try:
+        user = auth.get_user_by_email(request.email)
+        reset_link = auth.generate_password_reset_link(request.email)
+
+        sender_email = os.getenv("SMTP_EMAIL")
+        sender_password = os.getenv("SMTP_PASSWORD")
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Reset your TAM Tool password"
+        msg["From"] = f"TAM Tool <{sender_email}>"
+        msg["To"] = request.email
+
+        html = f"""
+        <html><body style="font-family:Arial,sans-serif;padding:20px;">
+        <div style="max-width:500px;margin:auto;border:1px solid #e5e7eb;border-radius:12px;padding:32px;">
+          <div style="text-align:center;margin-bottom:24px;">
+            <div style="background:#2563eb;width:48px;height:48px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;">
+              <span style="color:white;font-size:24px;font-weight:bold;">T</span>
+            </div>
+            <h2 style="color:#1f2937;margin-top:12px;">TAM Tool</h2>
+          </div>
+          <p style="color:#374151;">Hi {user.display_name or "there"},</p>
+          <p style="color:#374151;">You requested a password reset for your TAM Tool account.</p>
+          <div style="text-align:center;margin:32px 0;">
+            <a href="{reset_link}" 
+               style="background:#2563eb;color:white;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:600;">
+              Reset Password
+            </a>
+          </div>
+          <p style="color:#6b7280;font-size:13px;">This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
+          <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+          <p style="color:#9ca3af;font-size:12px;text-align:center;">© 2026 TAM Tool. All rights reserved.</p>
+        </div>
+        </body></html>
+        """
+        msg.attach(MIMEText(html, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, request.email, msg.as_string())
+
+        print(f"✅ Password reset email sent to {request.email}")
+        return {"message": "Password reset email sent successfully"}
+
+    except auth.UserNotFoundError:
+        return {"message": "If this email exists, a reset link has been sent"}
+    except Exception as e:
+        print(f"ERROR in forgot_password: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send reset email")
+
 @router.get("/user/{uid}")
 async def get_user(uid: str):
     try:
@@ -70,41 +129,27 @@ async def get_user(uid: str):
         print(f"DEBUG: Fetching user with UID: {uid}")
         user_doc = db.collection("users").document(uid).get()
         print(f"DEBUG: User document exists: {user_doc.exists}")
-        
-
         print(f"PROJECT BEING USED: {db.project}")
         if user_doc.exists:
             user_data = user_doc.to_dict()
             print(f"DEBUG: User data: {user_data}")
-            
-            # Check if this is an admin user and update if needed
             firebase_user = auth.get_user(uid)
             is_admin_email = firebase_user.email.lower().startswith("admin@")
-            
             if is_admin_email and not user_data.get("isAdmin"):
-                print(f"DEBUG: Admin user detected, updating document to set isAdmin=true and status=ACTIVE")
                 db.collection("users").document(uid).update({
                     "isAdmin": True,
                     "status": "ACTIVE"
                 })
                 user_data["isAdmin"] = True
                 user_data["status"] = "ACTIVE"
-            
             return user_data
         else:
-            # User doesn't exist in Firestore, try to get from Firebase Auth and create
             print(f"DEBUG: User not found in Firestore, attempting to create from Firebase Auth")
             try:
                 firebase_user = auth.get_user(uid)
                 print(f"DEBUG: Found Firebase Auth user: {firebase_user.email}")
-                
-                # Check if user is admin
                 is_admin = firebase_user.email.lower().startswith("admin@")
                 initial_status = "ACTIVE" if is_admin else "PENDING"
-                
-                print(f"DEBUG: Setting isAdmin={is_admin}, status={initial_status}")
-                
-                # Create user document in Firestore
                 db.collection("users").document(uid).set({
                     "uid": uid,
                     "name": firebase_user.display_name or firebase_user.email.split("@")[0],
@@ -115,9 +160,6 @@ async def get_user(uid: str):
                     "projectRoles": [],
                     "createdAt": firestore.SERVER_TIMESTAMP
                 })
-                print(f"DEBUG: Created new user document for {uid}")
-                
-                # Return the created user data (without SERVER_TIMESTAMP)
                 return {
                     "uid": uid,
                     "name": firebase_user.display_name or firebase_user.email.split("@")[0],
@@ -157,7 +199,7 @@ async def update_user_status(uid: str, body: dict):
         return {"message": "User status updated"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
 class AssignProjectRequest(BaseModel):
     projectId: str
     projectName: str

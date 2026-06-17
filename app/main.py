@@ -1,3 +1,6 @@
+from dotenv import load_dotenv  # ADD LINE 1
+load_dotenv()                   # ADD LINE 2
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.firebase import init_firebase
