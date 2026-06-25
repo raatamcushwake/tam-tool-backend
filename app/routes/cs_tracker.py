@@ -1,5 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 import openpyxl
+import re
 from io import BytesIO
 from datetime import datetime, date
 
@@ -31,8 +32,12 @@ def extract_latest_date(val):
     dates = []
     for part in parts:
         part = part.strip()
-        # Handle "2024-10-20 00:00:00" style
-        part = part.split(" ")[0].split("T")[0]
+        # Extract just the date token, ignoring trailing labels like "- Vishal"
+        match = re.match(r"^(\d{1,4}[/-]\d{1,2}[/-]\d{1,4})", part)
+        if match:
+            part = match.group(1)
+        else:
+            part = part.split(" ")[0].split("T")[0]
         d = parse_date(part)
         if d:
             dates.append(d)
@@ -82,13 +87,14 @@ async def parse_cs_tracker(file: UploadFile = File(...)):
                 continue
 
             due_date_val = get_col(row, "due date")
-            compliance_date_val = get_col(row, "compliance start date")
+            compliance_date_val = get_col(row, "compliance date")
             status_val = get_col(row, "status")
             remarks_val = str(get_col(row, "remarks") or "").strip()
 
-            # Format compliance date — may be multiline string
-            if isinstance(compliance_date_val, datetime):
-                compliance_date_str = compliance_date_val.strftime("%d/%m/%Y")
+            # Format compliance date — may contain multiple dates (take the latest)
+            compliance_date_parsed = extract_latest_date(compliance_date_val)
+            if compliance_date_parsed:
+                compliance_date_str = compliance_date_parsed.strftime("%d/%m/%Y")
             elif compliance_date_val:
                 compliance_date_str = str(compliance_date_val).strip()
             else:
@@ -120,6 +126,10 @@ async def parse_cs_tracker(file: UploadFile = File(...)):
                 "days_left": days_left,
                 "remarks": remarks_val,
             })
+
+        # Flag pending rows that still need a maker remark before submission
+        for item in items:
+            item["needs_remark"] = (item["computed_status"] == "Pending")
 
         summary = {
             "total": len(items),
