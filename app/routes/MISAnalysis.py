@@ -215,6 +215,7 @@ def process_comparison(prev_content, curr_content):
                                     "Unit No.": unit_no,
                                     "Status": "CANCELLATION",
                                     "Change Details": f"[CANCELLATION] {prev_name}",
+                                    "is_resale": True,
                                     "Customer Name": prev_name,
                                     "DEMAND_INCREMENT_VAL": 0.0,
                                     "RECEIVED_INCREMENT_VAL": 0.0,
@@ -240,9 +241,10 @@ def process_comparison(prev_content, curr_content):
                                 final_rows.append(cancelled_row)
                                 already_cancelled_units.add(unit_no)
 
-                                # Current unit becomes NEW BOOKING
+                                # Current unit becomes NEW BOOKING (Resale)
                                 status = "NEW"
                                 change_log = f"[NEW BOOKING] {prev_name} cancelled, rebooked to {curr_name_raw}"
+                                unit_data["is_resale"] = True
                                 demand_inc = demand_raised
                                 received_inc = amount_received
                                 unit_data["prev_agreement"] = 0
