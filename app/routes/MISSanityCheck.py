@@ -121,22 +121,27 @@ def process_mis_sanity(prev_content, curr_content):
                             unit_data['transfer_detected'] = True
                             transferred_units.append(unit_data)
                         else:
-                            # Treat as CANCELLATION of old + NEW BOOKING for new customer
+                            # Treat as CANCELLATION of old + NEW BOOKING for new customer (RESALE)
                             cancelled_row = prev_unit.copy()
                             cancelled_row.update({
                                 'Unit No.': unit_no,
                                 'is_cancelled': True,
+                                'is_resale': True,
                                 'prev_customer': prev_name,
                                 'Customer Name': prev_name,
                             })
                             cancelled_units.append(cancelled_row)
                             already_cancelled_units.add(unit_no)
 
-                            # Current unit is a new booking
+                            # Current unit is a new booking (Resale)
                             unit_data['is_new'] = True
                             unit_data['rebooked'] = True
+                            unit_data['is_resale'] = True
+                            unit_data['anomaly_detected'] = True
                             unit_data['prev_customer'] = prev_name
+                            unit_data['curr_customer'] = curr_name_raw
                             new_bookings.append(unit_data)
+                            anomaly_units.append(unit_data)
 
                 params = [
                     ('Agreement value', 'agreement', agreement_decreased, agreement_increased),
