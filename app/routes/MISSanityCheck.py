@@ -195,8 +195,10 @@ def process_mis_sanity(prev_content, curr_content):
                         elif delta > 0:
                             inc_list.append(unit_data)
             else:
+                is_sold_new = curr_name_lower not in ["", "nan", "n/a", "-", "unsold"]
                 unit_data['is_new'] = True
-                new_bookings.append(unit_data)
+                if is_sold_new:
+                    new_bookings.append(unit_data)
                 financial_params = [
                     ('Amount Received excl. Tax', 'amount_received', amount_increased),
                     ('Demand Raised as on Current Month excl. tax', 'demand', demand_increased),
@@ -254,6 +256,8 @@ def process_mis_sanity(prev_content, curr_content):
                 row['to_unit'] = curr_unit
                 units_to_drop_from_cancellations.add(old_unit)
 
+        units_to_drop_from_new_bookings = set()
+
         for row in new_bookings:
             curr_cust = str(row.get('Customer Name', '')).strip().upper()
             curr_unit = str(row.get('Unit No.', '')).strip()
@@ -271,6 +275,16 @@ def process_mis_sanity(prev_content, curr_content):
                 if row not in anomaly_units:
                     anomaly_units.append(row)
                 units_to_drop_from_cancellations.add(from_unit)
+                # This row is being reclassified as Anomaly — mirror Analysis's
+                # `row["Status"] = "ANOMALY"` behavior by removing it from New Bookings
+                # so it isn't double-counted in both buckets.
+                units_to_drop_from_new_bookings.add(curr_unit)
+
+        if units_to_drop_from_new_bookings:
+            new_bookings = [
+                row for row in new_bookings
+                if str(row.get('Unit No.', '')).strip() not in units_to_drop_from_new_bookings
+            ]
 
         if units_to_drop_from_cancellations:
             cancelled_units = [
