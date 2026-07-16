@@ -160,7 +160,8 @@ def process_comparison(prev_content, curr_content):
                             for u, r in prev_lookup.items() if u != unit_no
                         )
                         if prev_exists_elsewhere or curr_existed_in_prev:
-                            status = "TRANSFER"
+                            status = "ANOMALY"
+                            unit_data["is_resale"] = True
                             prev_unit_no = next(
                                 (u for u, r in prev_lookup.items()
                                  if str(r.get("Customer Name", "")).strip().lower() == curr_name_lower and u != unit_no),
@@ -175,7 +176,7 @@ def process_comparison(prev_content, curr_content):
                             from_unit_prev_name = str(prev_lookup.get(from_unit, {}).get("Customer Name", "")).strip() or prev_name
                             # Customer name in current unit (unit_no) in prev month
                             curr_unit_prev_name = str(prev_lookup.get(unit_no, {}).get("Customer Name", "")).strip()
-                            change_log = f"[TRANSFER] Unit {from_unit} → Unit {unit_no} | Customer: {from_unit_prev_name} → {curr_name_raw} | PrevOccupant: {curr_unit_prev_name}"
+                            change_log = f"[ANOMALY] Unit {from_unit} → Unit {unit_no} | Customer: {from_unit_prev_name} → {curr_name_raw} | PrevOccupant: {curr_unit_prev_name}"
                         else:
                             # Same unit, different customer name, not a fuzzy match, and neither
                             # name shows up anywhere else this/last month.
