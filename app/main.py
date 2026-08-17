@@ -1,3 +1,6 @@
+from dotenv import load_dotenv  # ADD LINE 1
+load_dotenv()                   # ADD LINE 2
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.firebase import init_firebase
@@ -30,7 +33,11 @@ app = FastAPI(
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://tam-cushman-wakefield.onrender.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
