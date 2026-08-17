@@ -10,6 +10,7 @@ router = APIRouter()
 class SimpleProjectRequest(BaseModel):
     name: str
     description: str = ""
+    enabledModules: list[str] = []
 
 @router.post("")
 async def create_project_simple(request: SimpleProjectRequest):
@@ -23,6 +24,7 @@ async def create_project_simple(request: SimpleProjectRequest):
             "description": request.description,
             "status": "ACTIVE",
             "members": {},
+            "enabledModules": request.enabledModules,
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         project_ref.set(project_data)
@@ -35,6 +37,7 @@ class ProjectRequest(BaseModel):
     makerId: str
     reviewerId: str
     managerId: str
+    enabledModules: list[str] = []
 
 class AssignRoleRequest(BaseModel):
     userId: str
@@ -57,6 +60,7 @@ async def create_project(request: ProjectRequest):
                 "reviewerId": request.reviewerId,
                 "managerId": request.managerId
             },
+            "enabledModules": request.enabledModules,
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         project_ref.set(project_data)
@@ -116,6 +120,23 @@ async def get_project(project_id: str):
         if not doc.exists:
             raise HTTPException(status_code=404, detail="Project not found")
         return doc.to_dict()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class UpdateModulesRequest(BaseModel):
+    enabledModules: list[str]
+
+@router.patch("/{project_id}/modules")
+async def update_project_modules(project_id: str, request: UpdateModulesRequest):
+    try:
+        db = get_firestore()
+        project_ref = db.collection("projects").document(project_id)
+        if not project_ref.get().exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+        project_ref.update({"enabledModules": request.enabledModules})
+        return {"enabledModules": request.enabledModules}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
