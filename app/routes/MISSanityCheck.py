@@ -92,11 +92,15 @@ def process_mis_sanity(prev_content, curr_content):
                 prev_unit = prev_lookup[unit_no]
                 prev_name = str(prev_unit.get('Customer Name', '')).strip()
                 unit_data['is_new'] = False
+                prev_was_unsold = prev_name.lower() in ["", "nan", "n/a", "-", "unsold"]
 
                 if curr_name_lower in ["unsold", "-", ""]:
                     unit_data['is_cancelled'] = True
                     unit_data['prev_customer'] = prev_name
                     cancelled_units.append(unit_data)
+                elif prev_was_unsold:
+                    unit_data['is_new'] = True
+                    new_bookings.append(unit_data)
                 elif prev_name.lower() != curr_name_lower:
                     similarity = difflib.SequenceMatcher(None, prev_name.lower(), curr_name_lower).ratio()
                     unit_data['prev_customer'] = prev_name
@@ -118,47 +122,83 @@ def process_mis_sanity(prev_content, curr_content):
                             if prev_unit_no != unit_no
                         )
                         if prev_customer_exists_elsewhere or curr_customer_existed_in_prev:
-                            unit_data['transfer_detected'] = True
-                            transferred_units.append(unit_data)
+                            unit_data['anomaly_detected'] = True
+                            unit_data['is_resale'] = True
+                            anomaly_units.append(unit_data)
                         else:
-                            # Treat as CANCELLATION of old + NEW BOOKING for new customer
-                            cancelled_row = prev_unit.copy()
-                            cancelled_row.update({
-                                'Unit No.': unit_no,
-                                'is_cancelled': True,
-                                'prev_customer': prev_name,
-                                'Customer Name': prev_name,
-                            })
-                            cancelled_units.append(cancelled_row)
-                            already_cancelled_units.add(unit_no)
+                            # Same unit, different customer name, not a fuzzy match, and neither
+                            # name shows up anywhere else this/last month.
+                            # Same booking date on both months -> Resale (Anomaly).
+                            # Different/missing booking date -> old customer cancelled this unit
+                            # and a new customer booked it fresh: split into Cancellation + New Booking.
+                            prev_bd = str(prev_unit.get('Booking Date', '')).strip()
+                            curr_bd = str(unit_data.get('Booking Date', '')).strip()
+                            same_booking_date = (
+                                prev_bd not in ('', '-', 'nan', 'NaT') and
+                                curr_bd not in ('', '-', 'nan', 'NaT') and
+                                prev_bd == curr_bd
+                            )
+                            if same_booking_date:
+                                unit_data['transfer_detected'] = True
+                                unit_data['anomaly_detected'] = True
+                                unit_data['is_resale'] = True
+                                unit_data['prev_customer'] = prev_name
+                                unit_data['curr_customer'] = curr_name_raw
+                                transferred_units.append(unit_data)
+                                anomaly_units.append(unit_data)
+                            else:
+                                cancelled_prev = prev_unit.copy()
+                                cancelled_prev.update({
+                                    'Unit No.': unit_no,
+                                    'is_cancelled': True,
+                                    'prev_customer': prev_name,
+                                    'Customer Name': prev_name,
+                                })
+                                cancelled_units.append(cancelled_prev)
+                                already_cancelled_units.add(unit_no)
+                                unit_data['is_new'] = True
+                                unit_data['is_split_new_booking'] = True
+                                new_bookings.append(unit_data)
 
-                            # Current unit is a new booking
-                            unit_data['is_new'] = True
-                            unit_data['rebooked'] = True
-                            unit_data['prev_customer'] = prev_name
-                            new_bookings.append(unit_data)
-
-                params = [
-                    ('Agreement value', 'agreement', agreement_decreased, agreement_increased),
-                    ('Amount Received excl. Tax', 'amount_received', amount_decreased, amount_increased),
-                    ('Demand Raised as on Current Month excl. tax', 'demand', demand_decreased, demand_increased),
-                    ('Saleable area in sft', 'saleable', saleable_decreased, saleable_increased),
-                    ('Carpet area in sft', 'carpet', carpet_decreased, carpet_increased)
-                ]
-                for excel_key, prefix, dec_list, inc_list in params:
-                    p_val = prev_unit.get(excel_key, 0)
-                    c_val = unit_data.get(excel_key, 0)
-                    delta = round(c_val - p_val, 2)
-                    unit_data[f'prev_{prefix}'] = p_val
-                    unit_data[f'{prefix}_delta'] = delta
-                    threshold = 100 if prefix in ('amount_received', 'demand') else 0
-                    if delta < -threshold:
-                        dec_list.append(unit_data)
-                    elif delta > 0:
-                        inc_list.append(unit_data)
+                if unit_data.get('is_split_new_booking'):
+                    unit_data['prev_agreement'] = 0
+                    unit_data['agreement_delta'] = 0
+                    unit_data['prev_amount_received'] = 0
+                    unit_data['amount_received_delta'] = unit_data.get('Amount Received excl. Tax', 0)
+                    if unit_data['amount_received_delta'] > 0:
+                        amount_increased.append(unit_data)
+                    unit_data['prev_demand'] = 0
+                    unit_data['demand_delta'] = unit_data.get('Demand Raised as on Current Month excl. tax', 0)
+                    if unit_data['demand_delta'] > 0:
+                        demand_increased.append(unit_data)
+                    unit_data['prev_saleable'] = 0
+                    unit_data['saleable_delta'] = 0
+                    unit_data['prev_carpet'] = 0
+                    unit_data['carpet_delta'] = 0
+                else:
+                    params = [
+                        ('Agreement value', 'agreement', agreement_decreased, agreement_increased),
+                        ('Amount Received excl. Tax', 'amount_received', amount_decreased, amount_increased),
+                        ('Demand Raised as on Current Month excl. tax', 'demand', demand_decreased, demand_increased),
+                        ('Saleable area in sft', 'saleable', saleable_decreased, saleable_increased),
+                        ('Carpet area in sft', 'carpet', carpet_decreased, carpet_increased)
+                    ]
+                    for excel_key, prefix, dec_list, inc_list in params:
+                        p_val = prev_unit.get(excel_key, 0)
+                        c_val = unit_data.get(excel_key, 0)
+                        delta = round(c_val - p_val, 2)
+                        unit_data[f'prev_{prefix}'] = p_val
+                        unit_data[f'{prefix}_delta'] = delta
+                        threshold = 100 if prefix in ('amount_received', 'demand') else 0
+                        if delta < -threshold:
+                            dec_list.append(unit_data)
+                        elif delta > 0:
+                            inc_list.append(unit_data)
             else:
+                is_sold_new = curr_name_lower not in ["", "nan", "n/a", "-", "unsold"]
                 unit_data['is_new'] = True
-                new_bookings.append(unit_data)
+                if is_sold_new:
+                    new_bookings.append(unit_data)
                 financial_params = [
                     ('Amount Received excl. Tax', 'amount_received', amount_increased),
                     ('Demand Raised as on Current Month excl. tax', 'demand', demand_increased),
@@ -185,6 +225,72 @@ def process_mis_sanity(prev_content, curr_content):
                     'Customer Name': "MISSING IN CURRENT"
                 })
                 cancelled_units.append(cancelled_unit)
+
+        # Cross-unit reassignment pass — mirrors MIS Analysis logic.
+        # If a customer who got cancelled from one unit reappears as a
+        # NEW booking (or was already flagged anomaly) on a different
+        # unit, treat it as a single Anomaly/Resale event and drop the
+        # now-redundant standalone Cancellation row.
+        prev_customer_to_unit = {}
+        for u, d in prev_lookup.items():
+            n = str(d.get('Customer Name', '')).strip().upper()
+            if n and n not in ["", "NAN", "N/A", "-", "UNSOLD"]:
+                prev_customer_to_unit[n] = u
+
+        cancelled_customers = {}
+        for row in cancelled_units:
+            cust = str(row.get('prev_customer', '') or row.get('Customer Name', '')).strip().upper()
+            unit = str(row.get('Unit No.', '')).strip()
+            if cust and cust not in ["", "NAN", "N/A", "-", "UNSOLD", "MISSING IN CURRENT"]:
+                cancelled_customers[cust] = unit
+
+        units_to_drop_from_cancellations = set()
+
+        for row in anomaly_units:
+            curr_cust = str(row.get('Customer Name', '')).strip().upper()
+            curr_unit = str(row.get('Unit No.', '')).strip()
+            old_unit = prev_customer_to_unit.get(curr_cust)
+            if old_unit and old_unit != curr_unit:
+                row['is_resale'] = True
+                row['from_unit'] = old_unit
+                row['to_unit'] = curr_unit
+                units_to_drop_from_cancellations.add(old_unit)
+
+        units_to_drop_from_new_bookings = set()
+
+        for row in new_bookings:
+            curr_cust = str(row.get('Customer Name', '')).strip().upper()
+            curr_unit = str(row.get('Unit No.', '')).strip()
+            from_unit = cancelled_customers.get(curr_cust)
+            if from_unit and from_unit != curr_unit:
+                from_unit_prev_name = str(prev_lookup.get(from_unit, {}).get('Customer Name', '')).strip()
+                curr_unit_prev_name = str(prev_lookup.get(curr_unit, {}).get('Customer Name', '')).strip()
+                curr_name_for_unit = str(row.get('Customer Name', '')).strip()
+                row['anomaly_detected'] = True
+                row['is_resale'] = True
+                row['from_unit'] = from_unit
+                row['to_unit'] = curr_unit
+                row['prev_customer'] = curr_unit_prev_name or from_unit_prev_name or 'Unsold'
+                row['curr_customer'] = curr_name_for_unit
+                if row not in anomaly_units:
+                    anomaly_units.append(row)
+                units_to_drop_from_cancellations.add(from_unit)
+                # This row is being reclassified as Anomaly — mirror Analysis's
+                # `row["Status"] = "ANOMALY"` behavior by removing it from New Bookings
+                # so it isn't double-counted in both buckets.
+                units_to_drop_from_new_bookings.add(curr_unit)
+
+        if units_to_drop_from_new_bookings:
+            new_bookings = [
+                row for row in new_bookings
+                if str(row.get('Unit No.', '')).strip() not in units_to_drop_from_new_bookings
+            ]
+
+        if units_to_drop_from_cancellations:
+            cancelled_units = [
+                row for row in cancelled_units
+                if str(row.get('Unit No.', '')).strip() not in units_to_drop_from_cancellations
+            ]
 
         def get_sums(list_data, delta_key):
             return sum(abs(u.get(delta_key, 0)) for u in list_data)

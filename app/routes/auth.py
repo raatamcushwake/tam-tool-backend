@@ -1,7 +1,4 @@
 import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from fastapi import APIRouter, HTTPException
 from firebase_admin import auth, firestore
 from app.core.firebase import get_firestore
@@ -23,6 +20,10 @@ class RegisterRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
+
+class ResetPasswordRequest(BaseModel):
+    uid: str
+    new_password: str
 
 @router.post("/create-user")
 async def create_user(request: CreateUserRequest):
@@ -70,49 +71,31 @@ async def register_user(request: RegisterRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
+@router.post("/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    try:
+        auth.update_user(request.uid, password=request.new_password)
+        return {"message": "Password reset successfully"}
+    except Exception as e:
+        print(f"ERROR in reset_password: {e}")
+        raise HTTPException(status_code=500, detail="Failed to reset password")
+    
 @router.post("/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest):
     try:
-        user = auth.get_user_by_email(request.email)
-        reset_link = auth.generate_password_reset_link(request.email)
-
-        sender_email = os.getenv("SMTP_EMAIL")
-        sender_password = os.getenv("SMTP_PASSWORD")
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "Reset your TAM Tool password"
-        msg["From"] = f"TAM Tool <{sender_email}>"
-        msg["To"] = request.email
-
-        html = f"""
-        <html><body style="font-family:Arial,sans-serif;padding:20px;">
-        <div style="max-width:500px;margin:auto;border:1px solid #e5e7eb;border-radius:12px;padding:32px;">
-          <div style="text-align:center;margin-bottom:24px;">
-            <div style="background:#2563eb;width:48px;height:48px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;">
-              <span style="color:white;font-size:24px;font-weight:bold;">T</span>
-            </div>
-            <h2 style="color:#1f2937;margin-top:12px;">TAM Tool</h2>
-          </div>
-          <p style="color:#374151;">Hi {user.display_name or "there"},</p>
-          <p style="color:#374151;">You requested a password reset for your TAM Tool account.</p>
-          <div style="text-align:center;margin:32px 0;">
-            <a href="{reset_link}" 
-               style="background:#2563eb;color:white;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:600;">
-              Reset Password
-            </a>
-          </div>
-          <p style="color:#6b7280;font-size:13px;">This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
-          <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
-          <p style="color:#9ca3af;font-size:12px;text-align:center;">© 2026 TAM Tool. All rights reserved.</p>
-        </div>
-        </body></html>
-        """
-        msg.attach(MIMEText(html, "html"))
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, request.email, msg.as_string())
-
+        auth.get_user_by_email(request.email)
+        
+        import httpx
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={os.getenv('FIREBASE_WEB_API_KEY')}",
+                json={
+                    "requestType": "PASSWORD_RESET",
+                    "email": request.email
+                }
+            )
+        
         print(f"✅ Password reset email sent to {request.email}")
         return {"message": "Password reset email sent successfully"}
 

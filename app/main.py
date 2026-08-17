@@ -1,6 +1,3 @@
-from dotenv import load_dotenv  # ADD LINE 1
-load_dotenv()                   # ADD LINE 2
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.firebase import init_firebase
@@ -10,6 +7,10 @@ from app.routes.MISSanityCheck import router as mis_sanity_router
 from app.routes.MISAnalysis import router as mis_analysis_router
 from app.routes.approval_firebase import router as approval_firebase_router
 from app.routes.cs_tracker import router as cs_tracker_router
+from app.routes.escrow import router as escrow_router
+from app.routes.collection_mapping import router as collection_mapping_router
+# from app.routes.pdf_reader import router as pdf_reader_router
+# from app.routes.approvals import router as approvals_router
 
 print("DEBUG: Starting app initialization...")
 
@@ -46,6 +47,12 @@ app.include_router(compliance.router, prefix="/api/compliance", tags=["Complianc
 app.include_router(mis_sanity_router, prefix="/api/mis-sanity", tags=["MIS Sanity"])
 app.include_router(mis_analysis_router, prefix="/api/mis-analysis", tags=["MIS Analysis"])
 app.include_router(cs_tracker_router, prefix="/api/cs-tracker", tags=["CS Tracker"])
+app.include_router(escrow_router, prefix="/api/escrow", tags=["Escrow"])
+app.include_router(collection_mapping_router, prefix="/api/collection-mapping", tags=["Collection Mapping"])
+# app.include_router(pdf_reader_router, prefix="/api/pdf-reader", tags=["PDF Reader"])
+# app.include_router(approvals_router, prefix="/api/approvals", tags=["Approvals"])
+
+
 
 
 
