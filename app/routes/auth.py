@@ -6,6 +6,34 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
+def enrich_project_roles(db, project_roles):
+    """Attach serviceLabel/serviceKey/enabledModules from the projects collection to each role entry."""
+    enriched = []
+    for pr in project_roles:
+        project_id = pr.get("projectId")
+        service_label = None
+        service_key = None
+        enabled_modules = []
+        if project_id:
+            try:
+                proj_doc = db.collection("projects").document(project_id).get()
+                if proj_doc.exists:
+                    proj_data = proj_doc.to_dict()
+                    service_label = proj_data.get("serviceLabel")
+                    service_key = proj_data.get("serviceKey")
+                    enabled_modules = proj_data.get("enabledModules", [])
+            except Exception as e:
+                print(f"WARNING: could not fetch project {project_id}: {e}")
+        enriched.append({
+            **pr,
+            "serviceLabel": service_label,
+            "serviceKey": service_key,
+            "enabledModules": enabled_modules,
+        })
+    return enriched
+
+MOCK_MODE = os.environ.get("MOCK_FIRESTORE", "false").lower() == "true"
+
 class CreateUserRequest(BaseModel):
     email: str
     password: str
@@ -107,6 +135,17 @@ async def forgot_password(request: ForgotPasswordRequest):
 
 @router.get("/user/{uid}")
 async def get_user(uid: str):
+    if MOCK_MODE:
+        print(f"DEBUG: MOCK_FIRESTORE active — returning fake profile for {uid}")
+        return {
+            "uid": uid,
+            "name": "Test User",
+            "email": "testuser@cushwake.com",
+            "phone": "",
+            "isAdmin": True,
+            "status": "ACTIVE",
+            "projectRoles": []
+        }
     try:
         db = get_firestore()
         print(f"DEBUG: Fetching user with UID: {uid}")
@@ -125,6 +164,9 @@ async def get_user(uid: str):
                 })
                 user_data["isAdmin"] = True
                 user_data["status"] = "ACTIVE"
+
+            user_data["projectRoles"] = enrich_project_roles(db, user_data.get("projectRoles", []))
+
             return user_data
         else:
             print(f"DEBUG: User not found in Firestore, attempting to create from Firebase Auth")
@@ -165,13 +207,43 @@ async def get_user(uid: str):
 
 @router.get("/users")
 async def get_all_users():
+    if MOCK_MODE:
+        print("DEBUG: MOCK_FIRESTORE active — returning fake user list")
+        return [
+            {
+                "uid": "GIKFBWhGbtQYWtY7rwPXZxzYf0m1",
+                "name": "Test User",
+                "email": "testuser@cushwake.com",
+                "phone": "",
+                "isAdmin": True,
+                "status": "ACTIVE",
+                "projectRoles": []
+            },
+            {
+                "uid": "fakeuid002",
+                "name": "Jane Pending",
+                "email": "jane.pending@cushwake.com",
+                "phone": "",
+                "isAdmin": False,
+                "status": "PENDING",
+                "projectRoles": []
+            },
+            {
+                "uid": "fakeuid003",
+                "name": "John Active",
+                "email": "john.active@cushwake.com",
+                "phone": "",
+                "isAdmin": False,
+                "status": "ACTIVE",
+                "projectRoles": []
+            }
+        ]
     try:
         db = get_firestore()
         users = db.collection("users").stream()
         return [u.to_dict() for u in users]
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 @router.patch("/user/{uid}/status")
 async def update_user_status(uid: str, body: dict):
     try:
