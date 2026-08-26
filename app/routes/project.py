@@ -3,6 +3,7 @@ from app.core.firebase import get_firestore
 from pydantic import BaseModel
 from typing import Optional
 from firebase_admin import firestore
+from app.utils.code_generator import generate_service_code
 
 router = APIRouter()
 
@@ -10,24 +11,64 @@ router = APIRouter()
 class SimpleProjectRequest(BaseModel):
     name: str
     description: str = ""
+    region: str = ""
     enabledModules: list[str] = []
+    enabledServices: dict[str, list[str]] = {}
+    basicInfo: dict = {}
+    creatorUid: str = ""
+    creatorName: str = ""
+    creatorRole: str = ""  # "ADMIN" or "MANAGER"
 
 @router.post("")
 async def create_project_simple(request: SimpleProjectRequest):
     try:
         db = get_firestore()
         project_ref = db.collection("projects").document()
+
+        flat_modules = sorted({m for mods in request.enabledServices.values() for m in mods})
+
         project_data = {
             "id": project_ref.id,
             "name": request.name,
             "projectName": request.name,
             "description": request.description,
+            "region": request.region,
             "status": "ACTIVE",
             "members": {},
-            "enabledModules": request.enabledModules,
+            "enabledServices": request.enabledServices,
+            "enabledModules": flat_modules or request.enabledModules,
+            "basicInfo": request.basicInfo,
+            "createdBy": request.creatorUid,
+            "createdByName": request.creatorName,
+            "createdByRole": request.creatorRole,
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         project_ref.set(project_data)
+
+        # A Manager who creates a project is auto-assigned MANAGER on it,
+        # one entry per enabled service, so it shows in their own project list.
+        if request.creatorUid and request.creatorRole == "MANAGER":
+            user_ref = db.collection("users").document(request.creatorUid)
+            service_entries = [
+                {
+                    "projectId": project_ref.id,
+                    "projectName": request.name,
+                    "role": "MANAGER",
+                    "serviceKey": key,
+                    "serviceLabel": "",
+                }
+                for key in request.enabledServices.keys()
+            ] or [{
+                "projectId": project_ref.id,
+                "projectName": request.name,
+                "role": "MANAGER",
+                "serviceKey": "",
+                "serviceLabel": "",
+            }]
+            user_ref.update({
+                "projectRoles": firestore.ArrayUnion(service_entries)
+            })
+
         return {"message": "Project created", "id": project_ref.id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -87,8 +128,28 @@ async def create_project(request: ProjectRequest):
 async def get_all_projects():
     try:
         db = get_firestore()
-        projects = db.collection("projects").stream()
-        return [p.to_dict() for p in projects]
+        docs = list(db.collection("projects").stream())
+        projects = []
+        for d in docs:
+            data = d.to_dict()
+            region = data.get("region") or "WES"
+            enabled_services = data.get("enabledServices", {})
+            codes = data.get("codes", {})
+
+            updated = False
+            for service_key in enabled_services:
+                if service_key not in codes:
+                    code = generate_service_code(db, region, service_key, data.get("createdAt"))
+                    if code:
+                        codes[service_key] = code
+                        updated = True
+
+            if updated:
+                db.collection("projects").document(d.id).update({"codes": codes})
+                data["codes"] = codes
+
+            projects.append(data)
+        return projects
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -123,8 +184,73 @@ async def get_project(project_id: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+class UpdateBasicInfoRequest(BaseModel):
+    name: str = None
+    region: str = None
+    basicInfo: dict = {}
+
+@router.patch("/{project_id}/basic-info")
+async def update_project_basic_info(project_id: str, request: UpdateBasicInfoRequest):
+    try:
+        db = get_firestore()
+        project_ref = db.collection("projects").document(project_id)
+        if not project_ref.get().exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        update_data = {"basicInfo": request.basicInfo}
+        if request.name:
+            update_data["name"] = request.name
+            update_data["projectName"] = request.name
+        if request.region:
+            update_data["region"] = request.region
+
+        project_ref.update(update_data)
+        return project_ref.get().to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class CloseServiceRequest(BaseModel):
+    serviceKey: str
+
+@router.patch("/{project_id}/close-service")
+async def close_project_service(project_id: str, request: CloseServiceRequest):
+    try:
+        db = get_firestore()
+        project_ref = db.collection("projects").document(project_id)
+        if not project_ref.get().exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        project_ref.update({
+            "closedServices": firestore.ArrayUnion([request.serviceKey])
+        })
+        return {"message": "Service closed", "serviceKey": request.serviceKey}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.patch("/{project_id}/reopen-service")
+async def reopen_project_service(project_id: str, request: CloseServiceRequest):
+    try:
+        db = get_firestore()
+        project_ref = db.collection("projects").document(project_id)
+        if not project_ref.get().exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        project_ref.update({
+            "closedServices": firestore.ArrayRemove([request.serviceKey])
+        })
+        return {"message": "Service reopened", "serviceKey": request.serviceKey}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 class UpdateModulesRequest(BaseModel):
-    enabledModules: list[str]
+    enabledModules: list[str] = []
+    enabledServices: dict[str, list[str]] = {}
 
 @router.patch("/{project_id}/modules")
 async def update_project_modules(project_id: str, request: UpdateModulesRequest):
@@ -133,8 +259,14 @@ async def update_project_modules(project_id: str, request: UpdateModulesRequest)
         project_ref = db.collection("projects").document(project_id)
         if not project_ref.get().exists:
             raise HTTPException(status_code=404, detail="Project not found")
-        project_ref.update({"enabledModules": request.enabledModules})
-        return {"enabledModules": request.enabledModules}
+
+        flat_modules = sorted({m for mods in request.enabledServices.values() for m in mods})
+
+        project_ref.update({
+            "enabledServices": request.enabledServices,
+            "enabledModules": flat_modules or request.enabledModules,
+        })
+        return {"enabledServices": request.enabledServices, "enabledModules": flat_modules}
     except HTTPException:
         raise
     except Exception as e:
@@ -301,7 +433,6 @@ async def get_activity_matrix(project_id: str, tower_name: str):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/{project_id}/activity-matrix/{tower_name}")
 @router.post("/{project_id}/activity-matrix/{tower_name}")
 async def save_activity_matrix_structure(project_id: str, tower_name: str, request: ActivityMatrixStructureRequest):
     try:
