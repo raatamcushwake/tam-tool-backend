@@ -12,6 +12,7 @@ from app.routes.approval_firebase import router as approval_firebase_router
 from app.routes.cs_tracker import router as cs_tracker_router
 from app.routes.escrow import router as escrow_router
 from app.routes.collection_mapping import router as collection_mapping_router
+from app.routes.tracker import router as tracker_router
 # from app.routes.pdf_reader import router as pdf_reader_router
 # from app.routes.approvals import router as approvals_router
 
@@ -56,6 +57,7 @@ app.include_router(mis_analysis_router, prefix="/api/mis-analysis", tags=["MIS A
 app.include_router(cs_tracker_router, prefix="/api/cs-tracker", tags=["CS Tracker"])
 app.include_router(escrow_router, prefix="/api/escrow", tags=["Escrow"])
 app.include_router(collection_mapping_router, prefix="/api/collection-mapping", tags=["Collection Mapping"])
+app.include_router(tracker_router, prefix="/api/tracker", tags=["Tracker"])
 # app.include_router(pdf_reader_router, prefix="/api/pdf-reader", tags=["PDF Reader"])
 # app.include_router(approvals_router, prefix="/api/approvals", tags=["Approvals"])
 
