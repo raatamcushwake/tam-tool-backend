@@ -6,30 +6,44 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
+SERVICE_LABELS = {
+    "continuous-monitoring": "Continuous Monitoring",
+    "periodic-monitoring": "Periodic Monitoring",
+    "tdd": "TDD",
+    "lie": "Lender Independent Engineering",
+}
+
 def enrich_project_roles(db, project_roles):
-    """Attach serviceLabel/serviceKey/enabledModules from the projects collection to each role entry."""
+    """For each role, expand into one entry per service enabled on that project."""
     enriched = []
     for pr in project_roles:
         project_id = pr.get("projectId")
-        service_label = None
-        service_key = None
-        enabled_modules = []
+        enabled_services = {}
         if project_id:
             try:
                 proj_doc = db.collection("projects").document(project_id).get()
                 if proj_doc.exists:
                     proj_data = proj_doc.to_dict()
-                    service_label = proj_data.get("serviceLabel")
-                    service_key = proj_data.get("serviceKey")
-                    enabled_modules = proj_data.get("enabledModules", [])
+                    enabled_services = proj_data.get("enabledServices", {})
             except Exception as e:
                 print(f"WARNING: could not fetch project {project_id}: {e}")
-        enriched.append({
-            **pr,
-            "serviceLabel": service_label,
-            "serviceKey": service_key,
-            "enabledModules": enabled_modules,
-        })
+
+        if enabled_services:
+            for service_key, modules in enabled_services.items():
+                enriched.append({
+                    **pr,
+                    "serviceKey": service_key,
+                    "serviceLabel": SERVICE_LABELS.get(service_key, service_key),
+                    "enabledModules": modules or [],
+                })
+        else:
+            # No services enabled on the project yet — keep the role visible as-is.
+            enriched.append({
+                **pr,
+                "serviceLabel": pr.get("serviceLabel"),
+                "serviceKey": pr.get("serviceKey"),
+                "enabledModules": [],
+            })
     return enriched
 
 MOCK_MODE = os.environ.get("MOCK_FIRESTORE", "false").lower() == "true"
@@ -259,6 +273,8 @@ class AssignProjectRequest(BaseModel):
     projectId: str
     projectName: str
     role: str
+    serviceKey: str
+    serviceLabel: str = ""
 
 @router.post("/user/{uid}/assign-project")
 async def assign_project(uid: str, body: AssignProjectRequest):
@@ -269,7 +285,9 @@ async def assign_project(uid: str, body: AssignProjectRequest):
             "projectRoles": firestore.ArrayUnion([{
                 "projectId": body.projectId,
                 "projectName": body.projectName,
-                "role": body.role
+                "role": body.role,
+                "serviceKey": body.serviceKey,
+                "serviceLabel": body.serviceLabel,
             }])
         })
         return {"message": "Project assigned successfully"}
