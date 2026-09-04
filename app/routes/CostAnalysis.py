@@ -1,372 +1,422 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
-import pandas as pd
 import io
-import re
-import logging
-from app.core.firebase import get_storage_bucket, get_firestore
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import List
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from app.core.firebase import get_storage_bucket, get_firestore_client
 
-logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ─── Helper ───────────────────────────────────────────────────
+def resolve_project_name(project_id: str) -> str:
+    """Look up the project's display name from Firestore, given its document ID.
+    Falls back to the raw project_id if no matching project is found."""
+    db = get_firestore_client()
+    doc = db.collection("projects").document(project_id).get()
+    if doc.exists:
+        data = doc.to_dict()
+        name = data.get("projectName") or data.get("name")
+        if name:
+            return name
+    return project_id
 
-def clean_num(val):
-    if pd.isna(val) or val == "" or str(val).strip().lower() in ["nan", "n/a", "-", "empty"]:
-        return 0.0
-    try:
-        cleaned = "".join(c for c in str(val) if c.isdigit() or c in [".", "-"])
-        return float(cleaned) if cleaned else 0.0
-    except:
-        return 0.0
-
-
-# ─── Extract Business Plan from uploaded file ─────────────────
-
-def extract_business_plan_data(bp_content):
-    try:
-        xl = pd.ExcelFile(io.BytesIO(bp_content), engine='openpyxl')
-        sheet_name = next((s for s in xl.sheet_names if "Business Plan" in s), xl.sheet_names[0])
-        df_bp = pd.read_excel(xl, sheet_name=sheet_name, header=None)
-        
-        print("DEBUG BP rows:", df_bp.shape)
-
-        # Find Projected Expenses row
-        outflow_row_idx = -1
-        for i in range(len(df_bp)):
-            cell_val = str(df_bp.iloc[i, 0]).strip().lower()
-            if "projected expenses" in cell_val:
-                outflow_row_idx = i
-                break
-            
-        print("OUTFLOW TOTAL row index:", outflow_row_idx)
-
-        # Find quarter row (row with Q1, Q2, Q3, Q4)
-        quarter_row_idx = -1
-        for i in range(min(10, len(df_bp))):
-            row_vals = [str(v).strip().upper() for v in df_bp.iloc[i]]
-            if any(v in ["Q1","Q2","Q3","Q4"] for v in row_vals):
-                quarter_row_idx = i
-                break
-            
-        # Find period row (row with month ranges like "Jul-Sep 2024")
-        period_row_idx = -1
-        for i in range(min(10, len(df_bp))):
-            row_str = " ".join(str(v) for v in df_bp.iloc[i]).lower()
-            if any(m in row_str for m in ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]):
-                if any(str(y) in row_str for y in range(2020, 2035)):
-                    period_row_idx = i
-                    break
-                
-        print("Quarter row:", quarter_row_idx, "Period row:", period_row_idx)
-
-        budget_by_period = {}
-
-        if outflow_row_idx >= 0 and quarter_row_idx >= 0:
-            quarter_row = df_bp.iloc[quarter_row_idx]
-            period_row = df_bp.iloc[period_row_idx] if period_row_idx >= 0 else [None]*len(quarter_row)
-            outflow_row = df_bp.iloc[outflow_row_idx]
-
-            for col_idx in range(len(quarter_row)):
-                q_val = str(quarter_row.iloc[col_idx]).strip().upper()
-                if q_val not in ["Q1","Q2","Q3","Q4"]:
-                    continue
-                period_label = str(period_row.iloc[col_idx]).strip() if period_row_idx >= 0 else ""
-                outflow_val = clean_num(outflow_row.iloc[col_idx])
-                # Convert to Crores (divide by 10000000)
-                outflow_cr = outflow_val / 10000000
-                if period_label and period_label != "nan":
-                    budget_by_period[period_label] = outflow_cr
-                    print(f"  Period: {period_label} | Quarter: {q_val} | Outflow: {outflow_cr} Cr")
-
-        return {"available_periods": [], "period_data": {}, "budget_by_period": budget_by_period}
-    except Exception as e:
-        logger.error(f"BP Extraction Error: {e}", exc_info=True)
-        return {"available_periods": [], "period_data": {}}
-
-
-# ─── Process Cost Analysis ─────────────────────────────────────
-
-def process_cost_analysis(business_plan_content, cleared_bills_content, reference_bp_content=None):
-    try:
-        bp_stats = extract_business_plan_data(reference_bp_content if reference_bp_content else business_plan_content)
-
-        bills_df = pd.read_excel(io.BytesIO(cleared_bills_content))
-
-        def simplify(text):
-            return re.sub(r'[^a-zA-Z0-9]', '', str(text)).lower()
-
-        required_cols_order = [
-            "Tranche", "Payment Clearance date", "Month",
-            "Costing Particular", "Supplier/ Vendor/Customer/Salaries/Others",
-            "Name", "Payment cleared"
-        ]
-        excel_col_map = {simplify(col): col for col in bills_df.columns}
-        final_src_mapping = {}
-        for col in required_cols_order:
-            simplified = simplify(col)
-            if simplified in excel_col_map:
-                final_src_mapping[col] = excel_col_map[simplified]
-
-        extracted_df = bills_df[list(final_src_mapping.values())].copy()
-        extracted_df = extracted_df.fillna("").replace([float('inf'), float('-inf')], "")
-        if "Payment Clearance date" in extracted_df.columns:
-            extracted_df["Payment Clearance date"] = extracted_df["Payment Clearance date"].astype(str)
-
-        if "Month" in final_src_mapping:
-            month_col = final_src_mapping["Month"]
-            def format_month_label(m):
-                m = str(m).strip()
-                parts = m.split("-")
-                if len(parts) == 2:
-                    mon = parts[0].capitalize()
-                    yr = parts[1]
-                    if len(yr) == 2:
-                        yr = "20" + yr
-                    return f"{mon}-{yr}"
-                return m
-            extracted_df[month_col] = extracted_df[month_col].astype(str).str.strip().apply(format_month_label)
-
-        month_col_name = final_src_mapping.get("Month")
-        payment_col_name = final_src_mapping.get("Payment cleared")
-        particular_col_name = final_src_mapping.get("Costing Particular")
-
-        all_bill_months = []
-        if month_col_name:
-            raw_months = extracted_df[month_col_name].dropna().unique().tolist()
-            raw_months = [m for m in raw_months if m and m != 'nan' and m != '']
-            month_order = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
-            def parse_month_sort(m):
-                m = str(m).strip().lower()
-                parts = m.split("-")
-                if len(parts) == 2:
-                    mon = parts[0][:3].lower()
-                    yr = parts[1]
-                    if len(yr) == 2: yr = "20" + yr
-                    try:
-                        return (int(yr), month_order.index(mon))
-                    except:
-                        return (9999, 99)
-                return (9999, 99)
-            all_bill_months = sorted(raw_months, key=parse_month_sort)
-
-        # ── Build bp_stats periods from bill months (NOT from BP Excel columns) ──
-        for month in all_bill_months:
-            bp_stats["period_data"][month] = {
-                "planned_budget": 0,
-                "period": month,
-                "is_quarterly": False
-            }
-            bp_stats["available_periods"].append({
-                "label": month,
-                "display_label": month,
-                "col_index": -1,
-                "period": month
-            })
-
-        # ── Read BP Excel for static columns only (Particular, BP CTC, Revised CTC, Pre) ──
-        bp_df_raw = pd.read_excel(io.BytesIO(business_plan_content), header=None, engine='openpyxl')
-
-        header_row_idx = 0
-        bp_ctc_col = None
-        revised_ctc_cols = []  # list of (col_index, header_label)
-        pre_col = None
-
-        for i in range(min(5, len(bp_df_raw))):
-            row_vals = [str(v).strip() for v in bp_df_raw.iloc[i]]
-            row_vals_lower = [v.lower() for v in row_vals]
-            for j, val in enumerate(row_vals_lower):
-                if "ctc" in val and ("bp" in val or "business" in val or "plan" in val):
-                    bp_ctc_col = j
-                if "revised" in val and "ctc" in val:
-                    revised_ctc_cols.append((j, row_vals[j]))  # store index + original label
-                if "pre" in val or ("total" in val and "expense" in val):
-                    pre_col = j
-            if bp_ctc_col is not None:
-                header_row_idx = i
-                break
-
-        # Remove duplicates keeping order
-        seen = set()
-        revised_ctc_cols = [(j, lbl) for j, lbl in revised_ctc_cols if not (j in seen or seen.add(j))]
-
-        # Most recent revised CTC = last one found
-        latest_revised_ctc_col = revised_ctc_cols[-1][0] if revised_ctc_cols else None
-
-        print(f"Found columns — BP CTC: {bp_ctc_col}, Revised CTCs: {revised_ctc_cols}, Pre: {pre_col}")
-
-        raw_rows = []
-        for row_idx in range(header_row_idx + 1, len(bp_df_raw)):
-            particular_name = str(bp_df_raw.iloc[row_idx, 0]).strip()
-            if not particular_name or particular_name.lower() in ["nan", "none", ""]:
-                particular_name = str(bp_df_raw.iloc[row_idx, 1]).strip() if bp_df_raw.shape[1] > 1 else ""
-
-            if not particular_name or simplify(particular_name) in ["total", "nan", "", "none"]:
-                continue
-
-            bp_ctc_raw = clean_num(bp_df_raw.iloc[row_idx, bp_ctc_col]) if bp_ctc_col is not None else 0.0
-            pre_val_raw = clean_num(bp_df_raw.iloc[row_idx, pre_col]) if pre_col is not None else 0.0
-
-            # All revised CTCs as list of {label, value}
-            all_revised_ctcs = []
-            for (col_idx, col_label) in revised_ctc_cols:
-                val = clean_num(bp_df_raw.iloc[row_idx, col_idx])
-                all_revised_ctcs.append({"label": col_label, "value": val})
-
-            # Latest revised CTC used for calculations
-            revised_ctc_raw = clean_num(bp_df_raw.iloc[row_idx, latest_revised_ctc_col]) if latest_revised_ctc_col is not None else 0.0
-
-            print(f"ROW {row_idx}: particular='{particular_name}' bp={bp_ctc_raw} revised_ctcs={all_revised_ctcs} pre={pre_val_raw}")
-
-            per_month_bills = {}
-            if particular_col_name and month_col_name and payment_col_name:
-                p_clean = simplify(particular_name)
-                for month in all_bill_months:
-                    mask = (
-                        extracted_df[particular_col_name].apply(simplify) == p_clean
-                    ) & (
-                        extracted_df[month_col_name].str.strip().str.lower() == month.lower()
-                    )
-                    subset = extracted_df[mask]
-                    amount = float(subset[payment_col_name].sum()) if len(subset) > 0 else 0.0
-                    transactions = subset.to_dict('records') if len(subset) > 0 else []
-                    per_month_bills[month] = {"amount": amount, "transactions": transactions}
-
-            raw_rows.append({
-                "particular": particular_name,
-                "bp_ctc": bp_ctc_raw,
-                "all_revised_ctcs": all_revised_ctcs,       # all versions
-                "revised_ctc": revised_ctc_raw,              # latest one for calculations
-                "pre_val": pre_val_raw,
-                "per_month_bills": per_month_bills
-            })
-
-        return {
-            "status": "success",
-            "raw_rows": raw_rows,
-            "all_bill_months": all_bill_months,
-            "revised_ctc_headers": [lbl for (_, lbl) in revised_ctc_cols],
-            "extracted_bills": {
-                "columns": required_cols_order,
-                "data": extracted_df.to_dict('records')
+# ── Structure (must mirror frontend/src/pages/CostReview.jsx SECTIONS) ──
+SECTIONS = [
+    {
+        "title": "RCC, Civil & Preliminary",
+        "subsections": [
+            {
+                "title": "Preliminary",
+                "items": [
+                    ("Pre", "BOUNDRY & FANCING"),
+                    ("Pre", "BORWEL & SOIL TESTING"),
+                    ("Pre", "Equipments"),
+                    ("Pre", "Safety"),
+                ],
             },
-            "bp_stats": bp_stats
+            {
+                "title": "RCC",
+                "items": [
+                    ("RCC", "Excavation & pilling"),
+                    ("RCC", "Steel"),
+                    ("RCC", "Concrete"),
+                    ("RCC", "Shuttering: Resi"),
+                    ("RCC", "Shuttering: Non Resi"),
+                    ("RCC", "Labor charges"),
+                    ("RCC", "Antitermite"),
+                    ("RCC", "Soiling & PCC"),
+                ],
+            },
+            {
+                "title": "Civil",
+                "items": [
+                    ("Civil", "waterproofing"),
+                    ("Civil", "Blockwork: Resi"),
+                    ("Civil", "Blockwork: Non Resi"),
+                    ("Civil", "Internal plaster: Resi"),
+                    ("Civil", "Internal plaster: Non Resi"),
+                    ("Civil", "External Plaster: Resi"),
+                    ("Civil", "External Plaster: Non Resi"),
+                ],
+            },
+        ],
+    },
+    {
+        "title": "Finishing",
+        "items": [
+            ("FINISHING", "Flooring: Resi"),
+            ("FINISHING", "Dado: Resi"),
+            ("FINISHING", "Flooring: Non Resi"),
+            ("FINISHING", "Kitchen platform"),
+            ("FINISHING", "Toilet counter"),
+            ("FINISHING", "Window sill"),
+            ("FINISHING", "Gypsum/ Patra  punning"),
+            ("FINISHING", "Door frame & shutter"),
+            ("FINISHING", "Door frame & shutter"),
+            ("FINISHING", "Windows"),
+            ("FINISHING", "Internal Paint: Resi"),
+            ("FINISHING", "Internal Paint: Non Resi"),
+            ("FINISHING", "External Paint"),
+            ("FINISHING", "S/c railing"),
+            ("FINISHING", "Window SS railing"),
+            ("FINISHING", "Fabrication: shutters"),
+            ("FINISHING", "False-ceiling"),
+        ],
+    },
+    {
+        "title": "MEP",
+        "items": [
+            ("MEP", "Plumbing: conceal"),
+            ("MEP", "Plumbing: Fixtures"),
+            ("MEP", "Electrical: Conceal"),
+            ("MEP", "Electrical: fixtures"),
+            ("MEP", "Elevator"),
+            ("MEP", "Pumps & Panels"),
+            ("MEP", "Stacker / tower parking"),
+            ("MEP", "Fire Fighting"),
+        ],
+    },
+    {
+        "title": "Infra",
+        "items": [
+            ("Infra", "STP"),
+            ("Infra", "DG SET"),
+            ("Infra", "Lighting protection system"),
+            ("Infra", "CCTV"),
+            ("Infra", "Compound Paving"),
+            ("Infra", "Compound wall"),
+            ("Infra", "Security cabin"),
+            ("Infra", "Gate"),
+            ("Infra", "SWD & Service chambers"),
+            ("Infra", "Tremix in parking area"),
+            ("Infra", "Meter room"),
+            ("Infra", "Sinages, Letter boxes, name plates & Building logo"),
+            ("Infra", "RWH"),
+        ],
+    },
+    {
+        "title": "Amenities",
+        "items": [
+            ("Amenities", "Gym"),
+            ("Amenities", "Changing room - Gents & Ladies"),
+            ("Amenities", "BMS"),
+            ("Amenities", "Panel Room"),
+            ("Amenities", "Landscape"),
+            ("Amenities", "Entrace Lobby"),
+            ("Amenities", "Façade: louvers"),
+            ("Amenities", "Building illumination"),
+        ],
+    },
+    {
+        "title": "Misc.",
+        "items": [
+            ("Misc.", "Electricity"),
+            ("Misc.", "Water"),
+            ("Misc.", "Security"),
+            ("Misc.", "Site Preparation"),
+            ("Misc.", "Misc O/H"),
+            ("Misc.", "mathadi"),
+        ],
+    },
+]
+
+
+def flatten_section(section):
+    if "subsections" in section:
+        items = []
+        for sub in section["subsections"]:
+            items.extend(sub["items"])
+        return items
+    return section["items"]
+
+
+FLAT_ITEMS = [item for section in SECTIONS for item in flatten_section(section)]
+
+STORAGE_PATH_TEMPLATE = "projects/{project_name}/TDD/CostReview.xlsx"
+
+# ── Schema (same shape the frontend already sends/expects) ──────────
+class AreaEntry(BaseModel):
+    value: str = ""
+    unit: str = "sft"
+    remarks: str = ""
+
+class Areas(BaseModel):
+    nonResi: AreaEntry = AreaEntry()
+    resi: AreaEntry = AreaEntry()
+
+class CostReviewRow(BaseModel):
+    coeff: str = ""
+    quantity: str = ""
+    unit: str = ""
+    rate: str = ""
+    remarks: str = ""
+
+class CostReviewPayload(BaseModel):
+    projectId: str
+    areas: Areas
+    rows: List[CostReviewRow]
+
+
+# ── Workbook builder ─────────────────────────────────────────────────
+HEADER_FILL = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")       # table header row
+SECTION_FILL = PatternFill(start_color="BFDBFE", end_color="BFDBFE", fill_type="solid")      # main particular
+SUBSECTION_FILL = PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid")   # sub particular
+SUBTOTAL_FILL = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")     # subsection / flat-section subtotal
+SECTION_TOTAL_FILL = PatternFill(start_color="FDE68A", end_color="FDE68A", fill_type="solid")# grouped-section Total
+GRAND_TOTAL_FILL = PatternFill(start_color="60A5FA", end_color="60A5FA", fill_type="solid")  # grand total
+
+BOLD = Font(bold=True)
+THIN = Side(style="thin", color="D1D5DB")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+WRAP_TOP = Alignment(wrap_text=True, vertical="top")
+
+
+def _apply_row_style(ws, row, fill=None, font=None, ncols=8):
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.border = BORDER
+        if fill:
+            cell.fill = fill
+        if font:
+            cell.font = font
+
+
+def build_workbook(areas: Areas, rows: List[CostReviewRow]) -> Workbook:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cost Review"
+
+    # Area summary (rows 1-3)
+    ws.append(["Non Resi Area", areas.nonResi.value or 0, areas.nonResi.unit or "sft", areas.nonResi.remarks])
+    ws.append(["Resi Area", areas.resi.value or 0, areas.resi.unit or "sft", areas.resi.remarks])
+    ws.append(["Total", "=B1+B2", "sft", ""])
+    for r in range(1, 4):
+        ws.cell(row=r, column=1).font = BOLD
+        _apply_row_style(ws, r, ncols=4)
+    ws.cell(row=3, column=1).fill = SUBTOTAL_FILL
+    ws.cell(row=3, column=2).fill = SUBTOTAL_FILL
+
+    ws.append([])  # blank row 4
+
+    # Table header (row 5)
+    ws.append(["Work Head", "Work Description", "Coeff", "Quantity", "Unit", "Rate", "Budget (in cr)", "Remarks"])
+    _apply_row_style(ws, 5, fill=HEADER_FILL, font=BOLD)
+
+    row_cursor = 6
+    idx = 0
+    grand_total_components = []
+
+    def write_item_row(head, desc, r, row_num):
+        ws.append([
+            head,
+            desc,
+            r.coeff,
+            float(r.quantity) if r.quantity not in ("", None) else "",
+            r.unit,
+            float(r.rate) if r.rate not in ("", None) else "",
+            f'=IF(OR(D{row_num}="",F{row_num}=""),0,D{row_num}*F{row_num}/10000000)',
+            r.remarks,
+        ])
+        _apply_row_style(ws, row_num)
+        ws.cell(row=row_num, column=2).alignment = WRAP_TOP  # Work Description, fully visible
+        ws.cell(row=row_num, column=8).alignment = WRAP_TOP  # Remarks, fully visible
+
+    for section in SECTIONS:
+        # Section header row
+        ws.append([section["title"]])
+        ws.merge_cells(start_row=row_cursor, start_column=1, end_row=row_cursor, end_column=8)
+        hdr_cell = ws.cell(row=row_cursor, column=1)
+        hdr_cell.font = Font(bold=True, size=12)
+        _apply_row_style(ws, row_cursor, fill=SECTION_FILL)
+        row_cursor += 1
+
+        if "subsections" in section:
+            subtotal_cells = []
+            for sub in section["subsections"]:
+                # Subsection header row
+                ws.append([f"    {sub['title']}"])
+                ws.merge_cells(start_row=row_cursor, start_column=1, end_row=row_cursor, end_column=8)
+                sub_cell = ws.cell(row=row_cursor, column=1)
+                sub_cell.font = Font(bold=True, italic=True)
+                _apply_row_style(ws, row_cursor, fill=SUBSECTION_FILL)
+                row_cursor += 1
+
+                sub_start = row_cursor
+                for head, desc in sub["items"]:
+                    r = rows[idx] if idx < len(rows) else CostReviewRow()
+                    write_item_row(head, desc, r, row_cursor)
+                    row_cursor += 1
+                    idx += 1
+                sub_end = row_cursor - 1
+
+                subtotal_row = row_cursor
+                ws.append(["", "", "", "", "", f"Subtotal — {sub['title']}", f"=SUM(G{sub_start}:G{sub_end})", ""])
+                _apply_row_style(ws, subtotal_row, fill=SUBTOTAL_FILL, font=BOLD)
+                subtotal_cells.append(f"G{subtotal_row}")
+                row_cursor += 1
+
+            # Section total = sum of subsection subtotals
+            section_total_row = row_cursor
+            ws.append(["", "", "", "", "", f"Total — {section['title']}", f"={'+'.join(subtotal_cells)}", ""])
+            _apply_row_style(ws, section_total_row, fill=SECTION_TOTAL_FILL, font=Font(bold=True, size=11))
+            grand_total_components.append(f"G{section_total_row}")
+            row_cursor += 1
+
+        else:
+            section_start = row_cursor
+            for head, desc in section["items"]:
+                r = rows[idx] if idx < len(rows) else CostReviewRow()
+                write_item_row(head, desc, r, row_cursor)
+                row_cursor += 1
+                idx += 1
+            section_end = row_cursor - 1
+
+            subtotal_row = row_cursor
+            ws.append(["", "", "", "", "", f"Subtotal — {section['title']}", f"=SUM(G{section_start}:G{section_end})", ""])
+            _apply_row_style(ws, subtotal_row, fill=SUBTOTAL_FILL, font=BOLD)
+            grand_total_components.append(f"G{subtotal_row}")
+            row_cursor += 1
+
+    grand_row = row_cursor
+    ws.append(["", "", "", "", "", "Grand Total", f"={'+'.join(grand_total_components)}", ""])
+    _apply_row_style(ws, grand_row, fill=GRAND_TOTAL_FILL, font=Font(bold=True, size=12, color="FFFFFF"))
+
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 42
+    ws.column_dimensions["C"].width = 10
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 10
+    ws.column_dimensions["F"].width = 12
+    ws.column_dimensions["G"].width = 16
+    ws.column_dimensions["H"].width = 32
+    ws.freeze_panes = "A6"
+
+    return wb
+
+
+def parse_workbook(wb: Workbook) -> dict:
+    ws = wb.active
+
+    def cell_str(row, col):
+        v = ws.cell(row=row, column=col).value
+        return "" if v is None else str(v)
+
+    areas = {
+        "nonResi": {"value": cell_str(1, 2), "unit": cell_str(1, 3) or "sft", "remarks": cell_str(1, 4)},
+        "resi": {"value": cell_str(2, 2), "unit": cell_str(2, 3) or "sft", "remarks": cell_str(2, 4)},
+    }
+
+    rows = [None] * len(FLAT_ITEMS)
+    occurrences_by_key = {}
+    for i, key in enumerate(FLAT_ITEMS):
+        occurrences_by_key.setdefault(key, []).append(i)
+    seen_counts = {}
+
+    for row in ws.iter_rows(min_row=6, max_row=ws.max_row):
+        head_val = row[0].value
+        desc_val = row[1].value
+        # Section / subsection headers are merged (desc cell is None) and
+        # subtotal/total rows leave column B empty — both get skipped here.
+        if not head_val or not desc_val:
+            continue
+        key = (str(head_val), str(desc_val))
+        occurrences = occurrences_by_key.get(key)
+        if not occurrences:
+            continue
+        count = seen_counts.get(key, 0)
+        if count >= len(occurrences):
+            continue
+        idx = occurrences[count]
+        seen_counts[key] = count + 1
+
+        coeff = row[2].value
+        qty = row[3].value
+        unit = row[4].value
+        rate = row[5].value
+        remarks = row[7].value
+        rows[idx] = {
+            "coeff": "" if coeff is None else str(coeff),
+            "quantity": "" if qty is None else str(qty),
+            "unit": "" if unit is None else str(unit),
+            "rate": "" if rate is None else str(rate),
+            "remarks": "" if remarks is None else str(remarks),
         }
 
-    except Exception as e:
-        logger.error(f"Cost Analysis Error: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
+    rows = [r if r is not None else {"coeff": "", "quantity": "", "unit": "", "rate": "", "remarks": ""} for r in rows]
+    return {"areas": areas, "rows": rows}
 
 
-# ─── ROUTES ───────────────────────────────────────────────────
-
-@router.post("/upload-bp")
-async def upload_cost_bp(
-    project_id: str = Form(...),
-    file: UploadFile = File(...)
-):
-    """Manager uploads Cost Budget (BP) Excel — stored in Firebase Storage"""
+# ── Routes ────────────────────────────────────────────────────────────
+@router.get("/{project_id}")
+async def get_cost_review(project_id: str):
     try:
-        content = await file.read()
+        project_name = resolve_project_name(project_id)
         bucket = get_storage_bucket()
-        blob = bucket.blob(f"projects/{project_id}/costReference/businessPlan_latest.xlsx")
-        blob.upload_from_string(content,
-            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        blob.make_public()
-        file_url = blob.public_url
-
-        db = get_firestore()
-        db.collection("projects").document(project_id)\
-          .collection("costReferenceData").document("businessPlan")\
-          .set({
-              "fileUrl": file_url,
-              "fileName": file.filename,
-              "uploadedAt": pd.Timestamp.now().isoformat(),
-          })
-
-        return {"status": "success", "message": "BP uploaded successfully", "fileUrl": file_url}
+        blob = bucket.blob(STORAGE_PATH_TEMPLATE.format(project_name=project_name))
+        if not blob.exists():
+            return {"projectId": project_id, "areas": {}, "rows": [], "status": "DRAFT"}
+        data = blob.download_as_bytes()
+        wb = load_workbook(io.BytesIO(data), data_only=False)
+        parsed = parse_workbook(wb)
+        return {"projectId": project_id, **parsed, "status": "SAVED"}
     except Exception as e:
-        logger.error(f"BP upload error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/run")
-async def run_cost_analysis(
-    project_id: str = Form(...),
-    cleared_bills: UploadFile = File(...)
-):
-    """Maker runs cost analysis — fetches BP from Firebase Storage, processes with cleared bills"""
+@router.post("/{project_id}")
+async def save_cost_review(project_id: str, payload: CostReviewPayload):
     try:
-        # Get BP file URL from Firestore
-        db = get_firestore()
-        bp_doc = db.collection("projects").document(project_id)\
-                   .collection("costReferenceData").document("businessPlan").get()
+        project_name = resolve_project_name(project_id)
+        wb = build_workbook(payload.areas, payload.rows)
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
 
-        if not bp_doc.exists:
-            raise HTTPException(status_code=400,
-                detail="No Cost Budget uploaded yet. Ask Manager to upload BP first.")
+        bucket = get_storage_bucket()
+        blob = bucket.blob(STORAGE_PATH_TEMPLATE.format(project_name=project_name))
+        blob.upload_from_file(
+            buffer,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        return {"message": "Cost Review saved to Storage", "path": blob.name}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-        bp_data = bp_doc.to_dict()
-        file_url = bp_data.get("fileUrl")
-        if not file_url:
-            raise HTTPException(status_code=400, detail="BP file URL missing.")
 
-        # Download BP from Firebase Storage
-        import urllib.request
-        with urllib.request.urlopen(file_url) as response:
-            bp_content = response.read()
-
-        # Read cleared bills
-        # Read cleared bills
-        cleared_bills_content = await cleared_bills.read()
-
-        # Fetch Reference Business Plan for OUTFLOW budget figures
-        reference_bp_content = None
-        try:
-            ref_doc = db.collection("projects").document(project_id)\
-                        .collection("referenceData").document("businessPlan").get()
-            if ref_doc.exists:
-                ref_url = ref_doc.to_dict().get("fileUrl")
-                if ref_url:
-                    with urllib.request.urlopen(ref_url) as resp:
-                        reference_bp_content = resp.read()
-                    print("Reference BP fetched for budget extraction")
-        except Exception as e:
-            print(f"Reference BP fetch failed: {e}")
-
-        # Run analysis
-        # Fetch last approved bills from Firestore for incremental tracking
-        last_approved_months = []
-        try:
-            approved_doc = db.collection("projects").document(project_id)\
-                             .collection("costApprovedData").document("latestApproved").get()
-            if approved_doc.exists:
-                approved_data = approved_doc.to_dict()
-                last_approved_months = approved_data.get("allBillMonths", [])
-                print(f"Last approved months: {last_approved_months}")
-        except Exception as e:
-            print(f"Could not fetch last approved data: {e}")
-
-        # Run analysis
-        result = process_cost_analysis(bp_content, cleared_bills_content, reference_bp_content)
-
-        # Tag which months are new vs previously approved
-        if result.get("status") == "success" and last_approved_months:
-            all_months = result.get("all_bill_months", [])
-            result["new_bill_months"] = [m for m in all_months if m not in last_approved_months]
-            result["previously_approved_months"] = last_approved_months
-        else:
-            result["new_bill_months"] = result.get("all_bill_months", [])
-            result["previously_approved_months"] = []
-
-        if result["status"] == "error":
-            raise HTTPException(status_code=400, detail=result["message"])
-
-        return result
-
+@router.get("/{project_id}/download-url")
+async def get_download_url(project_id: str):
+    """Optional: lets the frontend's 'Download Report' button link straight to the
+    stored workbook instead of generating a CSV client-side."""
+    try:
+        project_name = resolve_project_name(project_id)
+        bucket = get_storage_bucket()
+        blob = bucket.blob(STORAGE_PATH_TEMPLATE.format(project_name=project_name))
+        if not blob.exists():
+            raise HTTPException(status_code=404, detail="No Cost Review saved yet")
+        url = blob.generate_signed_url(expiration=3600, method="GET")
+        return {"url": url}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Cost analysis run error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
