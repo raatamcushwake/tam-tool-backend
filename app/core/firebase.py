@@ -28,12 +28,15 @@ def init_firebase():
                 project_id = json.load(f).get("project_id", "")
 
         _app = firebase_admin.initialize_app(cred, {
-            'storageBucket': f'{project_id}.appspot.com'
-        })
+    'storageBucket': f'{project_id}.firebasestorage.app'
+})
     return _app
 
-def get_firestore():
+def get_firestore_client():
     return firestore.client()
+
+def get_firestore():
+    return get_firestore_client()
 
 def get_auth():
     return auth
