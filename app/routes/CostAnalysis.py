@@ -173,19 +173,26 @@ def process_cost_analysis(business_plan_content, cleared_bills_content, referenc
         revised_ctc_cols = []  # list of (col_index, header_label)
         pre_col = None
 
+        bp_ctc_header = "CTC As Per BP"  # default fallback
+
         for i in range(min(5, len(bp_df_raw))):
             row_vals = [str(v).strip() for v in bp_df_raw.iloc[i]]
             row_vals_lower = [v.lower() for v in row_vals]
             for j, val in enumerate(row_vals_lower):
-                if "ctc" in val and ("bp" in val or "business" in val or "plan" in val):
+                if ("ctc" in val and ("bp" in val or "business" in val or "plan" in val)) or ("budget" in val and "revised" not in val):
                     bp_ctc_col = j
-                if "revised" in val and "ctc" in val:
-                    revised_ctc_cols.append((j, row_vals[j]))  # store index + original label
+                    bp_ctc_header = row_vals[j]
+                if "revised" in val and ("ctc" in val or "budget" in val):
+                    revised_ctc_cols.append((j, row_vals[j]))
                 if "pre" in val or ("total" in val and "expense" in val):
                     pre_col = j
             if bp_ctc_col is not None:
                 header_row_idx = i
                 break
+
+        # Flag: is this a plain "Cost Budget" style sheet (no CTC/BP language)?
+        is_cost_budget_format = "budget" in bp_ctc_header.lower() and "ctc" not in bp_ctc_header.lower()
+
 
         # Remove duplicates keeping order
         seen = set()
@@ -208,14 +215,21 @@ def process_cost_analysis(business_plan_content, cleared_bills_content, referenc
             bp_ctc_raw = clean_num(bp_df_raw.iloc[row_idx, bp_ctc_col]) if bp_ctc_col is not None else 0.0
             pre_val_raw = clean_num(bp_df_raw.iloc[row_idx, pre_col]) if pre_col is not None else 0.0
 
-            # All revised CTCs as list of {label, value}
-            all_revised_ctcs = []
-            for (col_idx, col_label) in revised_ctc_cols:
-                val = clean_num(bp_df_raw.iloc[row_idx, col_idx])
-                all_revised_ctcs.append({"label": col_label, "value": val})
-
             # Latest revised CTC used for calculations
-            revised_ctc_raw = clean_num(bp_df_raw.iloc[row_idx, latest_revised_ctc_col]) if latest_revised_ctc_col is not None else 0.0
+            revised_ctc_raw = (
+                clean_num(bp_df_raw.iloc[row_idx, latest_revised_ctc_col])
+                if latest_revised_ctc_col is not None
+                else bp_ctc_raw
+            )
+
+            # All revised CTCs as list of {label, value} — fallback to a single synthetic entry
+            if revised_ctc_cols:
+                all_revised_ctcs = [
+                    {"label": col_label, "value": clean_num(bp_df_raw.iloc[row_idx, col_idx])}
+                    for (col_idx, col_label) in revised_ctc_cols
+                ]
+            else:
+                all_revised_ctcs = [{"label": "Revised CTC", "value": bp_ctc_raw}]
 
             print(f"ROW {row_idx}: particular='{particular_name}' bp={bp_ctc_raw} revised_ctcs={all_revised_ctcs} pre={pre_val_raw}")
 
@@ -246,7 +260,9 @@ def process_cost_analysis(business_plan_content, cleared_bills_content, referenc
             "status": "success",
             "raw_rows": raw_rows,
             "all_bill_months": all_bill_months,
-            "revised_ctc_headers": [lbl for (_, lbl) in revised_ctc_cols],
+            "revised_ctc_headers": [lbl for (_, lbl) in revised_ctc_cols] or ["Revised CTC"],
+            "bp_ctc_header": bp_ctc_header,
+            "is_cost_budget_format": is_cost_budget_format,
             "extracted_bills": {
                 "columns": required_cols_order,
                 "data": extracted_df.to_dict('records')
